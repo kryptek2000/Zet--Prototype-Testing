@@ -1,0 +1,6 @@
+{
+  "name": "ZET — The Outcome-Aware Terminal",
+  "description": "A native-grade, outcome-aware development terminal and Mission Control workspace connecting commands, development workstreams, and verifiable outcomes.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
