@@ -64,6 +64,42 @@ pub struct RailSnapshot {
     pub footer_provenance: Provenance,
 }
 
+/// A real recorded command that failed (exit != 0) as shown in the inspector.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FailedCommandRow {
+    pub index: usize,
+    pub command: String,
+    pub exit: String,
+    pub duration: String,
+    pub provenance: Provenance,
+}
+
+/// A real journaled agent decision as shown in the inspector.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DecisionRow {
+    pub tier: String,
+    pub command: String,
+    pub status: String,
+    pub checkpoint: Option<String>,
+    pub provenance: Provenance,
+}
+
+/// Immutable snapshot rendered by the Context Inspector (Slice 5).
+///
+/// Adheres strictly to the A5 honesty contract (§4.3):
+/// - Session, CWD, branch: Observed
+/// - Failed commands: Inferred filter over Observed recorded blocks
+/// - Decisions: Observed from real journal entries
+/// - Verification section: ABSENT — not rendered at all.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InspectorSnapshot {
+    pub session_id: String,
+    pub cwd: String,
+    pub git_branch: String,
+    pub failed_commands: Vec<FailedCommandRow>,
+    pub decisions: Vec<DecisionRow>,
+}
+
 /// Cells consumed by one Unicode scalar in a rail row.
 ///
 /// The rail paints one glyph per scalar, so every printable scalar needs
@@ -286,14 +322,86 @@ pub fn format_footer(cwd: &str, cols: u32) -> String {
     format!("{prefix}{}", truncate_left_to_cells(&cwd, budget))
 }
 
+/// A failed command row in exactly `cols` cells or fewer:
+/// `<index> <command> -> <exit>`.
+pub fn format_failed_command_row(index: usize, command: &str, exit: &str, cols: u32) -> String {
+    let cols = cols as usize;
+    if cols == 0 {
+        return String::new();
+    }
+    let command = single_line(command);
+    let exit = single_line(exit);
+    let right = format!("-> {exit}");
+    let right_cells = text_cells(&right);
+    let prefix = format!("{index} ");
+    let prefix_cells = text_cells(&prefix);
+
+    if prefix_cells + right_cells >= cols {
+        return truncate_to_cells(&format!("{prefix}{exit}"), cols);
+    }
+    let budget = cols - prefix_cells - right_cells - 1;
+    let cmd_str = truncate_to_cells(&command, budget);
+    if cmd_str.is_empty() {
+        format!("{prefix}{right}")
+    } else {
+        format!("{prefix}{cmd_str} {right}")
+    }
+}
+
+/// An agent decision row in exactly `cols` cells or fewer:
+/// `<tier> <command> · <status>`.
+pub fn format_decision_row(tier: &str, command: &str, status: &str, cols: u32) -> String {
+    let cols = cols as usize;
+    if cols == 0 {
+        return String::new();
+    }
+    let tier = single_line(tier);
+    let command = single_line(command);
+    let status = single_line(status);
+
+    let prefix = format!("{tier} ");
+    let prefix_cells = text_cells(&prefix);
+    let right = format!("· {status}");
+    let right_cells = text_cells(&right);
+
+    if prefix_cells + right_cells >= cols {
+        return truncate_to_cells(&format!("{prefix}{status}"), cols);
+    }
+    let budget = cols - prefix_cells - right_cells - 1;
+    let cmd_str = truncate_to_cells(&command, budget);
+    if cmd_str.is_empty() {
+        format!("{prefix}{right}")
+    } else {
+        format!("{prefix}{cmd_str} {right}")
+    }
+}
+
+/// Header row for the inspector: `SESSION <id>`.
+pub fn format_inspector_header(session_id: &str, cols: u32) -> String {
+    let cols = cols as usize;
+    if cols == 0 {
+        return String::new();
+    }
+    let session_id = single_line(session_id);
+    let prefix = "SESSION ";
+    let prefix_cells = text_cells(prefix);
+    if cols <= prefix_cells || session_id.is_empty() {
+        return truncate_to_cells("SESSION", cols);
+    }
+    let budget = cols - prefix_cells;
+    format!("{prefix}{}", truncate_to_cells(&session_id, budget))
+}
+
 /// Dirty-flagged cache for panel snapshots. The rail is rebuilt at most
 /// once per frame and only when something observable changed.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ChromeCache {
     pub snapshot: Option<Arc<RailSnapshot>>,
+    pub inspector_snapshot: Option<Arc<InspectorSnapshot>>,
     pub dirty: bool,
     pub last_active: usize,
     pub last_layout_rail: bool,
+    pub last_layout_inspector: bool,
     pub last_blocks: usize,
     pub last_phase: Option<String>,
     pub last_cwd: String,
@@ -307,9 +415,11 @@ impl ChromeCache {
     pub fn new() -> Self {
         Self {
             snapshot: None,
+            inspector_snapshot: None,
             dirty: true,
             last_active: usize::MAX,
             last_layout_rail: false,
+            last_layout_inspector: false,
             last_blocks: usize::MAX,
             last_phase: None,
             last_cwd: String::new(),
@@ -330,6 +440,14 @@ impl ChromeCache {
 
     pub fn snapshot_handle(&self) -> Option<Arc<RailSnapshot>> {
         self.snapshot.clone()
+    }
+
+    pub fn inspector_snapshot(&self) -> Option<&InspectorSnapshot> {
+        self.inspector_snapshot.as_deref()
+    }
+
+    pub fn inspector_snapshot_handle(&self) -> Option<Arc<InspectorSnapshot>> {
+        self.inspector_snapshot.clone()
     }
 
     pub fn poll_due(&self, now: Instant) -> bool {
@@ -526,6 +644,78 @@ pub fn rail_row_layout(
     command_count: usize,
 ) -> Vec<RailRow> {
     rail_rows(viewport_rows, session_count, command_count)
+}
+
+/// One resolved inspector row for rendering and hit testing (Slice 5).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InspectorRow {
+    SessionHeader,
+    CwdHeader,
+    BranchHeader,
+    Rule1,
+    FailedHeader,
+    FailedCommand(usize),
+    Rule2,
+    DecisionsHeader,
+    Decision(usize),
+    Empty,
+}
+
+/// Deterministic inspector row layout.
+///
+/// Adheres strictly to the A5 honesty contract (§4.3):
+/// - Failed commands section renders only when failed_count > 0.
+/// - Decisions section renders only when decision_count > 0.
+/// - Verification section is ABSENT.
+pub fn inspector_rows(
+    viewport_rows: u32,
+    failed_count: usize,
+    decision_count: usize,
+) -> Vec<InspectorRow> {
+    let mut rows = vec![InspectorRow::Empty; viewport_rows as usize];
+    if viewport_rows == 0 {
+        return rows;
+    }
+    rows[0] = InspectorRow::SessionHeader;
+    if viewport_rows > 1 {
+        rows[1] = InspectorRow::CwdHeader;
+    }
+    if viewport_rows > 2 {
+        rows[2] = InspectorRow::BranchHeader;
+    }
+    if viewport_rows > 3 {
+        rows[3] = InspectorRow::Rule1;
+    }
+
+    let mut cursor = 4usize;
+    if failed_count > 0 && cursor < viewport_rows as usize {
+        rows[cursor] = InspectorRow::FailedHeader;
+        cursor += 1;
+        let capacity = (viewport_rows as usize).saturating_sub(cursor);
+        let visible_failed = failed_count.min(capacity.min(5));
+        for i in 0..visible_failed {
+            rows[cursor + i] = InspectorRow::FailedCommand(i);
+        }
+        cursor += visible_failed;
+    }
+
+    if decision_count > 0 && cursor < viewport_rows as usize {
+        if cursor < viewport_rows as usize {
+            rows[cursor] = InspectorRow::Rule2;
+            cursor += 1;
+        }
+        if cursor < viewport_rows as usize {
+            rows[cursor] = InspectorRow::DecisionsHeader;
+            cursor += 1;
+            let capacity = (viewport_rows as usize).saturating_sub(cursor);
+            let visible_decisions = decision_count.min(capacity);
+            for i in 0..visible_decisions {
+                rows[cursor + i] = InspectorRow::Decision(i);
+            }
+        }
+    }
+
+    rows
 }
 
 #[cfg(test)]
@@ -826,5 +1016,57 @@ mod tests {
             }
         });
         assert_eq!(builds, 2);
+    }
+
+    #[test]
+    fn inspector_rows_layout_omits_empty_sections() {
+        use super::{inspector_rows, InspectorRow};
+        // Zero failed, zero decisions: only session header rows.
+        let rows = inspector_rows(10, 0, 0);
+        assert_eq!(rows[0], InspectorRow::SessionHeader);
+        assert_eq!(rows[1], InspectorRow::CwdHeader);
+        assert_eq!(rows[2], InspectorRow::BranchHeader);
+        assert_eq!(rows[3], InspectorRow::Rule1);
+        for row in &rows[4..] {
+            assert_eq!(*row, InspectorRow::Empty);
+        }
+
+        // 2 failed commands, 0 decisions: failed header and commands present.
+        let rows = inspector_rows(12, 2, 0);
+        assert_eq!(rows[4], InspectorRow::FailedHeader);
+        assert_eq!(rows[5], InspectorRow::FailedCommand(0));
+        assert_eq!(rows[6], InspectorRow::FailedCommand(1));
+        assert_eq!(rows[7], InspectorRow::Empty);
+
+        // 1 failed command, 1 decision: both sections present with separating rule.
+        let rows = inspector_rows(14, 1, 1);
+        assert_eq!(rows[4], InspectorRow::FailedHeader);
+        assert_eq!(rows[5], InspectorRow::FailedCommand(0));
+        assert_eq!(rows[6], InspectorRow::Rule2);
+        assert_eq!(rows[7], InspectorRow::DecisionsHeader);
+        assert_eq!(rows[8], InspectorRow::Decision(0));
+    }
+
+    #[test]
+    fn failed_command_row_formats_and_fits() {
+        use super::{format_failed_command_row, text_cells};
+        let row = format_failed_command_row(1, "cargo test --workspace", "1", 32);
+        assert!(row.starts_with("1 cargo test"));
+        assert!(row.ends_with("-> 1"));
+        assert!(text_cells(&row) <= 32);
+
+        // Narrow width still preserves the exit code.
+        let row_narrow = format_failed_command_row(1, "cargo test --workspace", "127", 14);
+        assert!(row_narrow.ends_with("-> 127"));
+        assert!(text_cells(&row_narrow) <= 14);
+    }
+
+    #[test]
+    fn decision_row_formats_and_fits() {
+        use super::{format_decision_row, text_cells};
+        let row = format_decision_row("T2", "git push origin main", "approved · ran", 32);
+        assert!(row.starts_with("T2 "));
+        assert!(row.ends_with("· approved · ran"));
+        assert!(text_cells(&row) <= 32);
     }
 }

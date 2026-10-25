@@ -1,0 +1,40 @@
+name: CI
+
+on:
+  push:
+    branches: [ master ]
+  pull_request:
+    branches: [ master ]
+
+jobs:
+  verify:
+    name: Verify Release Gates
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Install system dependencies (zsh, Wayland, X11, libssl)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y zsh libx11-dev libx11-xcb-dev libwayland-dev libxkbcommon-dev libssl-dev pkg-config
+
+      - name: Setup empty .zshrc for non-interactive test
+        run: touch ~/.zshrc
+
+      - name: Gate 1 - cargo fmt
+        run: cargo fmt --all -- --check
+
+      - name: Gate 2 - cargo check
+        run: cargo check --workspace --all-targets
+
+      - name: Gate 3 - cargo clippy (-D warnings)
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: Gate 4 - cargo test
+        run: cargo test --workspace

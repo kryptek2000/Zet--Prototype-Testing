@@ -13,8 +13,8 @@ use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop, EventLoopProxy}
 use winit::keyboard::{Key, ModifiersState, NamedKey};
 use winit::window::Window;
 use zet_gpu::input::{
-    is_agent_toggle, is_close_tab, is_copy, is_cycle_tab, is_new_tab, is_paste, is_rail_toggle,
-    is_search, is_select_all, translate,
+    is_agent_toggle, is_close_tab, is_copy, is_cycle_tab, is_inspector_toggle, is_new_tab,
+    is_paste, is_rail_toggle, is_search, is_select_all, translate,
 };
 use zet_gpu::selection::Selection;
 use zet_gpu::Renderer;
@@ -903,7 +903,7 @@ impl App {
     }
 
     pub fn refresh_chrome_at(&mut self, now: std::time::Instant) {
-        if !self.layout.rail {
+        if !self.layout.rail && !self.layout.inspector {
             return;
         }
         let phase = self
@@ -962,6 +962,11 @@ impl App {
             snapshot,
             now,
         );
+        if self.layout.inspector {
+            self.chrome.inspector_snapshot = Some(Arc::new(self.build_inspector_snapshot()));
+        } else {
+            self.chrome.inspector_snapshot = None;
+        }
     }
 
     fn build_rail_snapshot(&self) -> panels::RailSnapshot {
@@ -1047,6 +1052,100 @@ impl App {
         }
     }
 
+    fn build_inspector_snapshot(&self) -> panels::InspectorSnapshot {
+        let (session_id, cwd, git_branch) = self
+            .tabs
+            .get(self.active)
+            .map(|tab| {
+                let id = tab
+                    .recorder
+                    .as_ref()
+                    .map(|r| r.session().to_string())
+                    .unwrap_or_else(|| format!("{}-{}", self.active + 1, self.shell_name));
+                let cwd = shell_cwd(&tab.session);
+                let branch = tab
+                    .recorder
+                    .as_ref()
+                    .map(|r| r.git_branch().to_string())
+                    .unwrap_or_default();
+                let branch = if branch.is_empty() {
+                    "—".to_string()
+                } else {
+                    branch
+                };
+                (id, if cwd.is_empty() { "—".to_string() } else { cwd }, branch)
+            })
+            .unwrap_or_else(|| ("—".to_string(), "—".to_string(), "—".to_string()));
+
+        let failed_commands = self
+            .tabs
+            .get(self.active)
+            .and_then(|tab| tab.recorder.as_ref())
+            .map(|recorder| {
+                recorder
+                    .recent_commands(16)
+                    .unwrap_or_default()
+                    .into_iter()
+                    .filter(|block| block.exit_code != 0)
+                    .take(5)
+                    .enumerate()
+                    .map(|(i, block)| panels::FailedCommandRow {
+                        index: i + 1,
+                        command: block.command,
+                        exit: block.exit_code.to_string(),
+                        duration: if block.duration_ms == 0 {
+                            "—".to_string()
+                        } else {
+                            format!("{}ms", block.duration_ms)
+                        },
+                        provenance: panels::Provenance::Inferred,
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        let decisions = self
+            .tabs
+            .get(self.active)
+            .map(|tab| {
+                tab.last_journal
+                    .iter()
+                    .take(4)
+                    .map(|entry| {
+                        let verdict = if !entry.approved {
+                            "denied".to_string()
+                        } else if entry.executed {
+                            format!(
+                                "ran (exit {})",
+                                entry
+                                    .exit_code
+                                    .map(|c| c.to_string())
+                                    .unwrap_or_else(|| "?".to_string())
+                            )
+                        } else {
+                            "approved".to_string()
+                        };
+                        panels::DecisionRow {
+                            tier: format!("{:?}", entry.tier),
+                            command: entry.command.clone(),
+                            status: verdict,
+                            checkpoint: entry.checkpoint.clone(),
+                            provenance: panels::Provenance::Observed,
+                        }
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        panels::InspectorSnapshot {
+            session_id,
+            cwd,
+            git_branch,
+            failed_commands,
+            decisions,
+        }
+    }
+
     /// Size every tab's grid + PTY to the terminal viewport.
     fn fit_all(&mut self) {
         let (cols, rows) = layout::terminal_viewport(
@@ -1066,12 +1165,25 @@ impl App {
 
     fn toggle_rail(&mut self) {
         self.layout.rail = !self.layout.rail;
-        self.layout.inspector = false;
         self.focus = Focus::Terminal;
         self.chrome.mark_dirty();
         self.fit_all();
         self.needs_draw = true;
         self.retitle();
+    }
+
+    fn toggle_inspector(&mut self) {
+        self.layout.inspector = !self.layout.inspector;
+        self.focus = Focus::Terminal;
+        self.chrome.mark_dirty();
+        self.fit_all();
+        self.needs_draw = true;
+        self.retitle();
+    }
+
+    fn inspector_cols(&self) -> usize {
+        let frame = self.frame_layout();
+        frame.inspector.map(|vp| vp.cols as usize).unwrap_or(0)
     }
 
     fn handle_mouse_click(&mut self, x: f64, y: f64, cw: u32, ch: u32) {
@@ -1206,6 +1318,85 @@ impl App {
                     r.draw_text_row(vp, row, 0, &footer, ink);
                 }
                 panels::RailRow::Empty => {}
+            }
+        }
+    }
+
+    fn draw_inspector(
+        r: &mut Renderer,
+        vp: zet_gpu::renderer::Viewport,
+        snapshot: &panels::InspectorSnapshot,
+    ) {
+        use zet_gpu::quad::Rgba;
+        let ink = zet_gpu::renderer::TAB_DIM_INK;
+        let err_ink = Rgba::rgb(0.95, 0.45, 0.45);
+        let ok_ink = Rgba::rgb(0.45, 0.85, 0.65);
+        let rows = panels::inspector_rows(
+            vp.rows,
+            snapshot.failed_commands.len(),
+            snapshot.decisions.len(),
+        );
+        for (row, kind) in rows.into_iter().enumerate() {
+            let row = row as u32;
+            match kind {
+                panels::InspectorRow::SessionHeader => {
+                    let line = panels::format_inspector_header(&snapshot.session_id, vp.cols);
+                    r.draw_text_row(vp, row, 0, &line, Rgba::WHITE);
+                }
+                panels::InspectorRow::CwdHeader => {
+                    let line = panels::truncate_left_to_cells(
+                        &format!("cwd {}", snapshot.cwd),
+                        vp.cols as usize,
+                    );
+                    r.draw_text_row(vp, row, 0, &line, ink);
+                }
+                panels::InspectorRow::BranchHeader => {
+                    let line = panels::truncate_to_cells(
+                        &format!("⎇ {}", snapshot.git_branch),
+                        vp.cols as usize,
+                    );
+                    r.draw_text_row(vp, row, 0, &line, ink);
+                }
+                panels::InspectorRow::Rule1 | panels::InspectorRow::Rule2 => {
+                    r.draw_fill(
+                        zet_gpu::renderer::Viewport {
+                            x: vp.x,
+                            y: vp.y + row,
+                            cols: vp.cols,
+                            rows: 1,
+                        },
+                        zet_gpu::quad::Rgba::rgb(0.11, 0.16, 0.24),
+                    );
+                }
+                panels::InspectorRow::FailedHeader => {
+                    r.draw_text_row(vp, row, 0, "FAILED COMMANDS", err_ink);
+                }
+                panels::InspectorRow::FailedCommand(idx) => {
+                    if let Some(cmd) = snapshot.failed_commands.get(idx) {
+                        let line = panels::format_failed_command_row(
+                            cmd.index,
+                            &cmd.command,
+                            &cmd.exit,
+                            vp.cols,
+                        );
+                        r.draw_text_row(vp, row, 0, &line, err_ink);
+                    }
+                }
+                panels::InspectorRow::DecisionsHeader => {
+                    r.draw_text_row(vp, row, 0, "DECISIONS", ok_ink);
+                }
+                panels::InspectorRow::Decision(idx) => {
+                    if let Some(dec) = snapshot.decisions.get(idx) {
+                        let line = panels::format_decision_row(
+                            &dec.tier,
+                            &dec.command,
+                            &dec.status,
+                            vp.cols,
+                        );
+                        r.draw_text_row(vp, row, 0, &line, ink);
+                    }
+                }
+                panels::InspectorRow::Empty => {}
             }
         }
     }
@@ -1623,6 +1814,10 @@ impl App {
                 self.toggle_rail();
                 return;
             }
+            if is_inspector_toggle(&logical, pressed, &mods) {
+                self.toggle_inspector();
+                return;
+            }
             match &logical {
                 Key::Named(NamedKey::Escape) => self.focus = Focus::Terminal,
                 Key::Named(NamedKey::ArrowUp) => {
@@ -1714,6 +1909,11 @@ impl App {
         // Mission Rail toggle (Ctrl+Shift+M).
         if is_rail_toggle(&logical, pressed, &mods) {
             self.toggle_rail();
+            return;
+        }
+        // Context Inspector toggle (Ctrl+Shift+I).
+        if is_inspector_toggle(&logical, pressed, &mods) {
+            self.toggle_inspector();
             return;
         }
         // Scrollback find: typing goes to the query, never the PTY.
